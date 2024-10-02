@@ -18,8 +18,9 @@ from __future__ import annotations
 
 import asyncio
 import datetime
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Dict, Optional
 
+from airflow.utils.module_loading import import_string
 import pendulum
 
 from airflow.triggers.base import BaseTrigger, TaskSuccessEvent, TriggerEvent
@@ -103,3 +104,63 @@ class TimeDeltaTrigger(DateTimeTrigger):
 
     def __init__(self, delta: datetime.timedelta, *, end_from_trigger: bool = False) -> None:
         super().__init__(moment=timezone.utcnow() + delta, end_from_trigger=end_from_trigger)
+
+
+class PeriodicTrigger(BaseTrigger):
+    """
+    A trigger that fires on a recurring basis until the callback condition is met.
+
+    This would be fantastic those looking to replace their custom sensors in reschedule mode with
+    something that is fully handled by the trigger (Ideal for cases where the waits are long, such
+    as polling for data completeness).
+
+    This is example is periodic (fixed time) for simplicity but supporting backoff rates should
+    be possible. Whether to make that 2 different classes or PeriodicTrigger being a specific
+    version of BackoffRateTrigger is up to discussion.  Down the line, this could be implemented so
+    that the baes sensor itself has deferrable=True or mode=deferrable support (which should be incomptabile with
+    mode=poke|reschedule).
+
+    The trigger follows the rule of no state and being serializable but one of the main things
+    to get feedback on is the serialization of the callback method.
+
+    Probably the most important thing to get feedback on is the serialziation and deserialization of
+    the callback object.  I looked into airflow.jobs.triggerer_job_runner code to see how the deserialization
+    of the class instances was done TriggerRunner.update_triggers calls self.get_trigger_by_classpath which
+    uses the util function import_string (and does caching).
+    """
+    def __init__(self, callback_objpath: str, interval_seconds: int, callback_kwargs: Optional[Dict] = None) -> None:
+        super().__init__()
+        self.callback_objpath = callback_objpath
+        self.interval_seconds = interval_seconds
+        self.callback: callable[..., bool] = import_string(self.callback_objpath)
+        self.callback_kwargs=callback_kwargs or dict() # or (x if x is not None else x)
+
+    def serialize(self) -> tuple[str, dict[str, Any]]:
+        return (
+            "airflow.triggers.temporal.PeriodicTrigger",
+            {
+                "callback_objpath": self.callback_objpath,
+                "interval_seconds": self.interval_seconds,
+                "callback_kwargs": self.callback_kwargs,
+            },
+        )
+
+    async def run(self) -> AsyncIterator[TriggerEvent]:
+        # Indirection leftover from a more complex real scenario.  Could be one function.
+        await self.wait_for_completion()
+        yield TaskSuccessEvent()
+
+    async def wait_for_completion(self):
+        """Loop until callback function returns True.  Similar to a Sensor
+            If False, wait a specific amount of time (which eventually could contain
+            backoff rates and more)
+        """
+        while True:
+            is_complete = self.callback(**self.callback_kwargs)
+            if not is_complete:
+                self.log.warning("Sleeping %d seconds", self.interval_seconds)
+                await asyncio.sleep(self.interval_seconds)
+            else:
+                self.log.warning("Condition met")
+                return is_complete
+

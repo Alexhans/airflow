@@ -20,11 +20,14 @@ import asyncio
 import datetime
 from unittest import mock
 
+from airflow.jobs.triggerer_job_runner import TriggerRunner
+from airflow.models.trigger import Trigger
+from airflow.serialization.serialized_objects import BaseSerialization
 import pendulum
 import pytest
 
 from airflow.triggers.base import TriggerEvent
-from airflow.triggers.temporal import DateTimeTrigger, TimeDeltaTrigger
+from airflow.triggers.temporal import DateTimeTrigger, TimeDeltaTrigger, PeriodicTrigger
 from airflow.utils import timezone
 from airflow.utils.state import TaskInstanceState
 from airflow.utils.timezone import utcnow
@@ -143,3 +146,56 @@ async def test_datetime_trigger_mocked(mock_sleep, mock_utcnow):
     result = trigger_task.result()
     assert isinstance(result, TriggerEvent)
     assert result.payload == trigger_moment
+
+
+def example_callback(target=5) -> bool:
+    import random
+    value = random.randint(0, 10)
+    print(f"cond: value {value} < {target} target")
+    if value < target:
+        return True
+    return False
+
+
+"""
+Hacky tests to confirm behaviour.  Nothing is mocked.
+Proper tests next.
+"""
+@pytest.mark.asyncio
+async def test_inefficient_non_mocked_periodic_trigger():
+    trigger = PeriodicTrigger(
+        interval_seconds=2,
+        callback_objpath="tests.triggers.test_temporal.example_callback",
+        callback_kwargs={"target": 3},
+    )
+    gen = trigger.run()
+    trigger_task = asyncio.create_task(gen.__anext__())
+    await trigger_task
+    assert trigger_task.done() is True
+
+
+def test_serialize_recreate_periodic_trigger():
+    # Logic quickly copy pasted from providers.amazon.aws.triggers.test_serialization
+    trigger = PeriodicTrigger(
+        interval_seconds=10,
+        callback_objpath="tests.triggers.test_temporal.example_callback",
+        callback_kwargs={"param1":4, "param2":6},
+    )
+    # generate the DB object from the trigger
+    trigger_db: Trigger = Trigger.from_object(trigger)
+
+    # serialize/deserialize using the same method that is used when inserting in DB
+    json_params = BaseSerialization.serialize(trigger_db.kwargs)
+    retrieved_params = BaseSerialization.deserialize(json_params)
+
+    # recreate a new trigger object from the data we would have in DB
+    clazz = TriggerRunner().get_trigger_by_classpath(trigger_db.classpath)
+    # noinspection PyArgumentList
+    instance = clazz(**retrieved_params)
+
+    # recreate a DB column object from the new trigger so that we can easily compare attributes
+    trigger_db_2: Trigger = Trigger.from_object(instance)
+
+    assert trigger_db.classpath == trigger_db_2.classpath
+    assert trigger_db.kwargs == trigger_db_2.kwargs
+
